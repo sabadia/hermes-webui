@@ -3,6 +3,52 @@
 
 ## [Unreleased]
 
+## [v0.51.202] — 2026-06-01 — Release FV (stage-batch14 — filter interrupted-recovery control text from visible transcript)
+
+### Fixed
+- Interrupted SSE-recovery control text (the synthetic `stale_interrupted_event` run-journal payload) is now kept out of the visible chat transcript instead of being replayed as a message: it's marked `recovery_control` on the backend and filtered across the `msgContent()` render path, the SSE settle/error handlers, and final transcript filtering, so platform-only control state no longer leaks into the conversation (#3321, @franksong2702).
+
+## [v0.51.201] — 2026-06-01 — Release FU (stage-batch13 — colored diff lines in tool-card snippets)
+
+### Added
+- Tool-card result snippets that contain a unified diff now render with the same green/red/cyan diff coloring already used for diffs in chat messages (reusing the existing `.diff-block` styles), with an expand/collapse toggle that preserves the coloring. Non-diff snippets are unchanged (#3336, @mysoul12138).
+
+## [v0.51.200] — 2026-06-01 — Release FT (stage-batch12 — remote-gateway health probe + ephemeral-turn-field preservation)
+
+### Fixed
+- The Tasks/Cron panel no longer shows a spurious "Gateway not configured" banner in multi-container Docker deployments where the WebUI image doesn't ship the `gateway` Python package: agent-health now probes the remote gateway via `HERMES_API_URL` before falling back to the local `gateway.status` import. Closes #3281 (#3312, @Sanjays2402).
+- Force-reloading the active session (`loadSession(sid, {forceReload:true})`) no longer drops ephemeral turn fields (`_turnUsage`, `_turnDuration`, `_turnTps`, `_gatewayRouting`, `_statusCard`): the ephemeral-field carry-forward now reads the prior `S.messages` before it's reset, so the token-usage badge and status cards survive an external refresh. Closes #3306 (#3313, @Sanjays2402).
+
+## [v0.51.199] — 2026-06-01 — Release FS (stage-batch11 — pinned-scroll recovery + inline-math currency false-positive)
+
+### Fixed
+- Pinned chat now recovers its scroll position after a DOM rebuild: `_setMessageScrollToBottom` retries on the next layout frame, and `scrollIfPinned` re-pins when the pane has drifted more than 500px from the bottom, so a message-list rebuild no longer leaves a pinned conversation stranded mid-scroll. Closes #3319 (#3330, @jianongHe).
+- The `$...$` inline-math renderer no longer treats currency like `$1,000 xuống ~$95` as math: the opening `$` followed by a digit is now rejected (aligning with smd's `se()` guard), so dollar amounts render as plain text. Digit-leading inline math (e.g. `$2x = 4$`) should now use the LaTeX-style `\(2x = 4\)` or display `$$2x = 4$$` delimiters (#3311, @toanalien).
+
+## [v0.51.198] — 2026-06-01 — Release FR (stage-batch10 — custom-provider reasoning model-id normalize + profile skill counts + run-adapter RFC slice)
+
+### Fixed
+- Reasoning-effort detection for named `custom:*` providers now normalizes non-slash model ids before applying its fallback family heuristics, so separator variants such as `deepseek.v3.2`, `deepseek_v4_flash`, and vendor-namespaced ids like `vendor.deepseek.v3.2` resolve the same way as `deepseek-v4-flash`. The keyword fallback is now token-aware rather than substring-based, preserving names like `model-thinking-preview` without falsely enabling reasoning for unrelated prefixes such as `thinkinghub.llama-3.1-70b` (#3327, @Carry00).
+- Profile cards now show enabled vs compatible skill counts (computed with an 8s TTL cache that clears on profile switch) instead of a single ambiguous count. Closes #3339 (#3341, @b3nw).
+
+### Changed
+- The #1925 runtime-adapter RFC now marks the configured runner-client boundary as shipped in v0.51.188 (#3073 / #3274) and defines the next Slice 4g gate for a supervised local runner process harness: real runner-owned `AIAgent` execution, restart/reattach proof, bounded runner health diagnostics, and no new WebUI runtime-surrogate globals (#3334, @Michaelyklam).
+
+## [v0.51.197] — 2026-06-01 — Release FQ (stage-batch9 — stop agent replaying edited/undone messages)
+
+### Fixed
+- Editing or undoing a message no longer lets the agent replay the original pre-edit content from `state.db`: the truncation-watermark filter now also skips replaced/stale rows whose timestamp sorts *below* the watermark, and `POST /api/session/truncate` truncates `context_messages` in sync with `messages` so the agent's context matches the visible transcript after Edit/Regenerate. The earlier `_clamp_context_to_watermark()` approach (which turned the watermark into a permanent ceiling that dropped every new turn) is removed. Closes #2914 (#3102, @AlexeyDsov).
+
+## [v0.51.196] — 2026-06-01 — Release FP (stage-batch8 — file-manager external sessions + artifacts tool metadata + edge-toggle icon + type hints)
+
+### Fixed
+- File manager (folder download, raw file fetch, and related handlers) now falls back to a `state.db` lookup for sessions created by Telegram/CLI rather than the WebUI, resolving them against the active WebUI workspace instead of returning a 404. Closes #3280 (#3314, @Sanjays2402).
+- Artifacts tab now detects files from structured `tool_calls` (OpenAI format) and `tool_use` content blocks (Anthropic format) on messages, not just text-mined diff fences, so artifacts surface even when `S.toolCalls` is cleared after a reload; display paths are trimmed of the workspace prefix (#3329, @mysoul12138).
+- Workspace panel edge-toggle chevron now points left (toward the panel it reveals) instead of right (#3318, @xz-dev).
+
+### Internal
+- `api/state_sync.py` now uses `Optional[T]` annotations for parameters defaulting to `None` instead of the implicit `T = None` form (#3323, @kuishou68).
+
 ## [v0.51.195] — 2026-06-01 — Release FO (stage-batch7 — hide attachment path markers in chat UI)
 
 ### Fixed

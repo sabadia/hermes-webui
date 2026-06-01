@@ -2226,8 +2226,8 @@ let _scrollPinned=true;
 let _programmaticScroll=false;
 let _nearBottomCount=0;
 let _lastScrollTop=null;
-let _lastNonMessageScrollIntentMs=0;
-let _lastMessageUpwardIntentMs=0;
+let _lastNonMessageScrollIntentMs=-Infinity;
+let _lastMessageUpwardIntentMs=-Infinity;
 let _messageUserUnpinned=false;
 let _bottomSettleToken=0;
 const NON_MESSAGE_SCROLL_INTENT_SUPPRESS_MS=350;
@@ -2758,12 +2758,34 @@ function _setMessageScrollToBottom(){
   _lastScrollTop=el.scrollTop;
   _nearBottomCount=2;
   _scrollPinned=true;
-  requestAnimationFrame(()=>{ setTimeout(()=>{_programmaticScroll=false;},0); });
+  requestAnimationFrame(()=>{
+    // Retry the bottom write on the next layout frame so a DOM rebuild that
+    // grows the transcript after the first write doesn't strand a pinned
+    // conversation mid-scroll (#3319). But by this frame the user may have
+    // scrolled up — re-check intent and DON'T snap them back or re-pin if so;
+    // only release the programmatic-scroll latch.
+    if(_messageUserUnpinned || !_scrollPinned
+       || (typeof _recentMessageUpwardIntent==='function' && _recentMessageUpwardIntent())
+       || _recentNonMessageScrollIntent()){
+      requestAnimationFrame(()=>{ setTimeout(()=>{_programmaticScroll=false;},0); });
+      return;
+    }
+    el.scrollTop=el.scrollHeight;
+    _lastScrollTop=el.scrollTop;
+    _nearBottomCount=2;
+    _scrollPinned=true;
+    requestAnimationFrame(()=>{ setTimeout(()=>{_programmaticScroll=false;},0); });
+  });
 }
 function _isMessagePaneNearBottom(threshold=250){
   const el=$('messages');
   if(!el) return false;
   return el.scrollHeight-el.scrollTop-el.clientHeight<=threshold;
+}
+function _messageBottomDistance(){
+  const el=$('messages');
+  if(!el) return 0;
+  return el.scrollHeight-el.scrollTop-el.clientHeight;
 }
 function _shouldFollowMessagesOnDomReplace(){
   return !_messageUserUnpinned && (_scrollPinned || _isMessagePaneNearBottom(1200));
@@ -2793,6 +2815,7 @@ function _settleMessageScrollToBottom(force){
 function scrollIfPinned(){
   if(!_scrollPinned) return;
   if(_recentNonMessageScrollIntent()) return;
+  if(_messageBottomDistance()>500) _setMessageScrollToBottom();
   _settleMessageScrollToBottom(false);
 }
 function scrollToBottom(){
@@ -3098,9 +3121,10 @@ function renderMd(raw){
   s=s.replace(/\$\$([\s\S]+?)\$\$/g,(_,m)=>{math_stash.push({type:'display',src:m});return '\x00M'+(math_stash.length-1)+'\x00';});
   // Match a single literal backslash before the display delimiter (the common LLM form).
   s=s.replace(/\\\[([\s\S]+?)\\\]/g,(_,m)=>{math_stash.push({type:'display',src:m});return '\x00M'+(math_stash.length-1)+'\x00';});
-  // Inline math: $...$ — require non-space at boundaries to avoid false positives
-  // e.g. "costs $5 and $10" should not trigger (space after opening $)
-  s=s.replace(/\$([^\s$\n][^$\n]*?[^\s$\n]|\S)\$/g,(_,m)=>{if(m.includes(' | '))return '\$'+m+'\$';math_stash.push({type:'inline',src:m});return '\x00M'+(math_stash.length-1)+'\x00';});
+  // Inline math: $...$ — require non-space/non-digit at opening boundary to avoid
+  // false positives on currency like "$1,000 xuống ~$95" or "costs $5 and $10".
+  // Aligns with smd's se() guard which also rejects $ followed by digits.
+  s=s.replace(/\$([^\s$\d\n][^$\n]*?[^\s$\n]|[^\s\d])\$/g,(_,m)=>{if(m.includes(' | '))return '\$'+m+'\$';math_stash.push({type:'inline',src:m});return '\x00M'+(math_stash.length-1)+'\x00';});
   // Also stash \(...\) LaTeX delimiters.
   // Match a single literal backslash before the delimiter (the common LLM form).
   s=s.replace(/\\\((.+?)\\\)/g,(_,m)=>{math_stash.push({type:'inline',src:m});return '\x00M'+(math_stash.length-1)+'\x00';});
@@ -5404,6 +5428,29 @@ function msgContent(m){
   return String(c).trim();
 }
 
+function _isRecoveryControlMessageText(text){
+  const normalized=String(text||'').replace(/\s+/g,' ').trim();
+  if(!normalized) return false;
+  const systemRecovery=/^\[System:/i.test(normalized)
+    && /previous response was cut off by a network error/i.test(normalized)
+    && /continue exactly where you left off/i.test(normalized);
+  const backendRecovery=/^the live worker stopped before this run finished\.?$/i.test(normalized);
+  return !!(systemRecovery || backendRecovery);
+}
+function _isRecoveryControlMessage(m){
+  if(!m||m.role==='tool') return false;
+  if(m.recovery_control===true) return true;
+  // Backward-compat ONLY: strict fully-anchored text match for pre-marker
+  // persisted sessions. NOT provider_details_label — a real "Response
+  // interrupted" card carries 'Interruption details' and must stay visible.
+  return _isRecoveryControlMessageText(msgContent(m)||String(m.content||''));
+}
+function _assistantMessageHasVisibleContent(m){
+  if(!m||m.role!=='assistant') return false;
+  if(_isRecoveryControlMessage(m)) return false;
+  return !!msgContent(m);
+}
+
 function _fmtDateSep(d){
   const todayStart=new Date();todayStart.setHours(0,0,0,0);
   const dStart=new Date(d);dStart.setHours(0,0,0,0);
@@ -6356,10 +6403,12 @@ function renderMessages(options){
     if(!m||!m.role||m.role==='tool')return false;
     if(_isContextCompactionMessage(m)) return false;
     if(_isPreservedCompressionTaskListMessage(m)) return false;
+    if(_isRecoveryControlMessage(m)) return false;
     if(m.role==='assistant'){
       const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
       const hasTu=Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use');
       if(hasTc||hasTu||_messageHasReasoningPayload(m)) return true;
+      if(_assistantMessageHasVisibleContent(m)) return true;
     }
     return m._statusCard||msgContent(m)||m.attachments?.length;
   });
@@ -6386,9 +6435,10 @@ function renderMessages(options){
     for(const m of S.messages){
       if(!m||!m.role||m.role==='tool'){ri++;continue;}
       if(_isPreservedCompressionTaskListMessage(m)){ri++;continue;}
+      if(_isRecoveryControlMessage(m)){ri++;continue;}
       const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
       const hasTu=Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use');
-      if(msgContent(m)||m._statusCard||m.attachments?.length||(m.role==='assistant'&&(hasTc||hasTu||_messageHasReasoningPayload(m)))) rebuilt.push({m,rawIdx:ri});
+      if(msgContent(m)||m._statusCard||m.attachments?.length||(m.role==='assistant'&&(hasTc||hasTu||_messageHasReasoningPayload(m)||_assistantMessageHasVisibleContent(m)))) rebuilt.push({m,rawIdx:ri});
       ri++;
     }
     _visWithIdxCache=rebuilt;
@@ -7120,12 +7170,51 @@ function buildToolCard(tc){
           Object.entries(tc.args).map(([k,v])=>`<div><span class="tool-arg-key">${esc(k)}</span> <span class="tool-arg-val">${esc(String(v))}</span></div>`).join('')
         }</div>`:''}
         ${displaySnippet?`<div class="tool-card-result">
-          <pre>${esc(displaySnippet)}</pre>
-          ${hasMore?`<button class="tool-card-more" data-full="${esc(tc.snippet||'').replace(/"/g,'&quot;')}" data-short="${esc(displaySnippet||'').replace(/"/g,'&quot;')}" data-more-label="${esc(moreLabel)}" data-less-label="${esc(lessLabel)}" onclick="event.stopPropagation();const p=this.previousElementSibling;const full=this.dataset.full;const short=this.dataset.short;p.textContent=p.textContent===short?full:short;this.textContent=p.textContent===short?this.dataset.moreLabel:this.dataset.lessLabel">${esc(moreLabel)}</button>`:''}
+          <pre>${tc.is_diff||_snippetLooksLikeDiff(displaySnippet)?`<code class="diff-block" data-highlighted="1">${_colorDiffLines(displaySnippet)}</code>`:esc(displaySnippet)}</pre>
+          ${hasMore?`<button class="tool-card-more" data-full="${esc(tc.snippet||'').replace(/"/g,'&quot;')}" data-short="${esc(displaySnippet||'').replace(/"/g,'&quot;')}" data-is-diff="${tc.is_diff||_snippetLooksLikeDiff(displaySnippet)?1:0}" data-more-label="${esc(moreLabel)}" data-less-label="${esc(lessLabel)}" onclick="event.stopPropagation();_toggleToolDiff(this)">${esc(moreLabel)}</button>`:''}
         </div>`:''}
       </div>`:''}
     </div>`;
   return row;
+}
+
+function _colorDiffLines(text){
+  if(typeof text !== 'string') return esc(String(text||''));
+  return esc(text).split('\n').map(line=>{
+    if(line.startsWith('@@')) return `<span class="diff-line diff-hunk">${line}</span>`;
+    if(line.startsWith('+')&&!line.startsWith('+++')) return `<span class="diff-line diff-plus">${line}</span>`;
+    if(line.startsWith('-')&&!line.startsWith('---')) return `<span class="diff-line diff-minus">${line}</span>`;
+    return `<span class="diff-line">${line}</span>`;
+  }).join('\n');
+}
+
+// Detect if text looks like a unified diff (has @@ hunk headers and +/- lines).
+function _snippetLooksLikeDiff(text){
+  if(typeof text!=='string'||text.length<10) return false;
+  if(!/^@@\s/.test(text)) return false;
+  const lines=text.split('\n');
+  let plusMinus=0;
+  for(let i=0;i<lines.length&&i<50;i++){
+    const l=lines[i];
+    if(l.startsWith('+')||l.startsWith('-')) plusMinus++;
+  }
+  return plusMinus>=2;
+}
+
+function _toggleToolDiff(btn){
+  const pre=btn.closest('.tool-card-result')?.querySelector('pre');
+  if(!pre) return;
+  const isDiff=btn.dataset.isDiff==='1';
+  const expanded=btn.textContent===btn.dataset.moreLabel;
+  const raw=expanded?btn.dataset.full:btn.dataset.short;
+  if(isDiff){
+    let code=pre.querySelector('code');
+    if(!code){code=document.createElement('code');code.className='diff-block';pre.textContent='';pre.appendChild(code);}
+    code.innerHTML=_colorDiffLines(raw);
+  }else{
+    pre.textContent=raw;
+  }
+  btn.textContent=expanded?btn.dataset.lessLabel:btn.dataset.moreLabel;
 }
 
 function _syncToolCallGroupSummary(group){
